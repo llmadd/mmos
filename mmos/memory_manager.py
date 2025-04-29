@@ -1,13 +1,10 @@
-"""
-记忆管理器模块
-"""
-
 import json
 import os
 from typing import List, Dict, Any, Optional, Union, Callable
 import time
 
 from .models import Memory
+from pydantic import BaseModel
 
 
 class MemoryManager:
