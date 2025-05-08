@@ -1,237 +1,162 @@
-from openai import OpenAI, AsyncOpenAI
+from openai import OpenAI
+from openai.types.create_embedding_response import CreateEmbeddingResponse
 import os
-from typing import List, Dict, Any, Union, Optional
+from dotenv import load_dotenv
+from chromadb import PersistentClient
+from typing import List, Dict, Any, Optional, Union, Iterable, Literal
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances, manhattan_distances, pairwise_distances
+import json
+load_dotenv()
+
+os.environ["OPENAI_API_KEY"] = "sk-proj-1234567890"
+os.environ["OPENAI_BASE_URL"] = "http://180.153.21.76:12118/v1"
+os.environ["EMBEDDING_MODEL"] = "text-embedding-3-small"
+os.environ["CHROMA_DB_PATH"] = "mmos/vector_db"
+
+
+
+
+test_cases = """
+[
+
+  {
+    "messages": [
+      {"role": "user", "content": "推荐几个巴黎的景点"},
+      {"role": "assistant", "content": "埃菲尔铁塔、卢浮宫、蒙马特高地都值得一去"},
+      {"role": "user", "content": "卢浮宫需要预约吗"}
+    ],
+    "expected_result": true
+  },
+
+
+  {
+    "messages": [
+      {"role": "user", "content": "Python的异常处理怎么写"},
+      {"role": "assistant", "content": "建议使用try-except结构"},
+      {"role": "user", "content": "那finally什么时候用"}
+    ],
+    "expected_result": true
+  },
+
+
+  {
+    "messages": [
+      {"role": "user", "content": "如何煮意大利面"},
+      {"role": "assistant", "content": "水开后煮8分钟加盐"},
+      {"role": "user", "content": "特斯拉股票今天涨了吗"}
+    ],
+    "expected_result": false
+  },
+
+  {
+    "messages": [
+      {"role": "user", "content": "介绍下Transformer架构"},
+      {"role": "assistant", "content": "基于自注意力机制的深度学习模型"},
+      {"role": "user", "content": "它的训练成本有多高"}
+    ],
+    "expected_result": true
+  },
+
+  {
+    "messages": [
+      {"role": "user", "content": "明天北京天气怎样"},
+      {"role": "assistant", "content": "晴天，15-22℃"},
+      {"role": "user", "content": "上海呢"}
+    ],
+    "expected_result": true
+  }
+]
 """
-短期记忆模块
 
-可能需要：
-1. 语言检测
-
-
-接收messages，返回messages格式。
-1. 小于2轮对话直接返回
-2. 大于2轮对话，最后两轮不改变，其余内容进行压缩
-3. 判定对话相关性（基于内容、基于时间等）不相关对话上下文剥离
-4. AI与算法两种模式，以及混合模型
-
-
-纯算法实现逻辑：
-
-# 对话消息处理技术方案（基于OpenAI messages格式）
-
-## 一、相关性判定技术栈
-
-### 1. 基于TF-IDF的语义指纹技术
-**技术组成**：
-- Scikit-learn的TfidfVectorizer
-- 余弦相似度计算
-- 关键词扩展算法
-
-**处理流程**：
-1. 对所有user消息构建TF-IDF矩阵
-2. 为每条消息生成语义指纹（Top-N高权重词）
-3. 计算新消息与历史消息指纹的相似度
-
-**作用解释**：
-- 将每条消息转换为数值向量
-- 通过向量距离衡量语义相似性
-- 解决表面词不匹配但语义相关的问题（如"价格"-"多少钱"）
-
-**消息处理方式**：
-- 只比较user消息之间的相关性
-- assistant消息的相关性由其对应的user消息决定
-- 示例：
-  ```python
-  # messages示例
-  [
-      {"role": "user", "content": "推荐餐厅"}, 
-      {"role": "assistant", "content": "附近有三家..."},
-      {"role": "user", "content": "有什么好吃的"}
-  ]
-  # 比较"推荐餐厅"和"有什么好吃的"的相似度
-  ```
-
-### 2. 基于TextRank的对话主题图
-**技术组成**：
-- NetworkX图算法库
-- 关键词共现分析
-- 窗口滑动算法
-
-**处理流程**：
-1. 将每3轮对话作为一个分析窗口
-2. 构建关键词共现图
-3. 使用PageRank算法识别核心主题词
-
-**作用解释**：
-- 识别对话中的核心话题节点
-- 检测话题漂移和切换点
-- 建立跨轮次的主题关联
-
-**消息处理方式**：
-- 对user和assistant消息统一分析
-- 标记包含相同核心主题词的消息块
-- 示例主题图：
-  ```
-  [餐厅]--(推荐)-->[美食]--(川菜)-->[辣度]
-  ```
-
-### 3. 基于布隆过滤器的快速筛选
-**技术组成**：
-- PyBloom实现
-- 关键词哈希映射
-- 多重哈希函数
-
-**处理流程**：
-1. 提取所有历史消息的实体名词
-2. 构建布隆过滤器
-3. 新消息关键词快速匹配
-
-**作用解释**：
-- 实现O(1)时间复杂度的初筛
-- 过滤明显无关的消息
-- 减少后续复杂计算量
-
-**消息处理方式**：
-- 对user消息进行完整过滤
-- 对assistant消息只检查其包含的实体
-
-## 二、内容压缩技术栈
-
-### 1. 基于TF-IDF的层次化压缩
-**技术组成**：
-- 关键词权重排序
-- 句子重要性评分
-- 实体保留机制
-
-**处理流程**：
-1. 计算消息中每个词的TF-IDF权重
-2. 按权重降序选取关键成分
-3. 重组保留核心语义的压缩句
-
-**作用解释**：
-- 保留信息密度最高的内容
-- 去除冗余修饰语
-- 维持基本语法结构
-
-**消息处理方式**：
-- **user消息压缩**：
-  - 保留疑问词和否定词
-  - 示例：
-    ```
-    原始："我想找一个价格不太贵而且环境比较好的西餐厅"
-    压缩："找不贵环境好的西餐厅"
-    ```
-
-- **assistant消息压缩**：
-  - 保留数据性内容和结论
-  - 示例：
-    ```
-    原始："推荐ABC西餐厅，人均200元，评分4.5，有露天座位"
-    压缩："ABC西餐厅：200元/4.5分/有露台"
-    ```
-
-### 2. 基于TextRank的摘要生成
-**技术组成**：
-- 句子相似度矩阵
-- 图节点权重计算
-- 重要性阈值过滤
-
-**处理流程**：
-1. 将多轮对话构建为句子图
-2. 计算每个句子的TextRank值
-3. 提取权重最高的1-2个句子
-
-**作用解释**：
-- 识别对话中最具代表性的语句
-- 生成连贯的摘要
-- 保持上下文完整性
-
-**消息处理方式**：
-- 对连续相关的3-5轮对话整体压缩
-- 示例：
-  ```python
-  # 原始messages
-  [
-      {"role": "user", "content": "推荐景点"},
-      {"role": "assistant", "content": "故宫是必去的..."},
-      {"role": "user", "content": "门票多少钱"},
-      {"role": "assistant", "content": "旺季60元..."}
-  ]
-  # 压缩后
-  "用户询问景点推荐和门票，推荐故宫(旺季60元)"
-  ```
-
-### 3. 基于问答对的模板化压缩
-**技术组成**：
-- 预定义问答模板
-- 槽位填充机制
-- 实体关系抽取
-
-**处理流程**：
-1. 识别问答对模式
-2. 匹配预定义模板
-3. 提取关键信息填充槽位
-
-**作用解释**：
-- 结构化存储对话核心
-- 极大提升压缩率
-- 便于后续检索
-
-**消息处理方式**：
-- 将相邻的user-assistant消息对作为处理单元
-- 示例模板：
-  ```
-  [景点推荐] 
-  问：{景点类型} 
-  答：{推荐名称}{价格}{特色}
-  ```
-
-## 三、消息处理策略（无时间维度）
-
-### 1. 角色区分处理原则
-- **User消息优先**：作为相关性判断的基准和压缩的重点
-- **Assistant消息从属**：其相关性由引发它的user消息决定
-- **系统消息特殊处理**：标记但不参与常规分析
-
-### 2. 处理流程设计
-```
-原始messages输入
-    ↓
-[角色分离器] → 分离user/assistant消息流
-    ↓
-[相关性判定层] ← 只分析user消息
-    ↓
-[消息分组器] → 按相关性分组对话块
-    ↓
-[内容压缩器] → 对每组分别压缩
-    ↓ 
-[重组输出] → 保持最后两轮完整
-```
-
-### 3. 关键设计决策
-1. **比较基准选择**：
-   - 始终以最新user消息为比较基准
-   - 历史user消息作为被比较对象
-
-2. **压缩粒度控制**：
-   - 单条user消息：关键词提取
-   - 问答对：模板化压缩
-   - 多轮对话：TextRank摘要
-
-3. **信息保留策略**：
-   - 必保留项：数字、实体、结论
-   - 可丢弃项：修饰语、重复解释
-   - 特殊保留：否定词和疑问词
-
-这种方案完全基于消息内容和角色进行处理，不依赖时间维度，符合OpenAI messages的基本处理逻辑，在保持较高信息保真度的同时可以实现60-70%的压缩率。
-
-"""
+test_cases = json.loads(test_cases)
 
 class ShortMemory:
-    def __init__(self) -> None:
-        self.time_weight = False
-        self.ai_mode = False
-        self.ai_model = "gpt-4o-mini"
-        self.ai_api_key = os.getenv("OPENAI_API_KEY")
+    def __init__(self):
+        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL"))
+        self.embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+        self.chroma_client = PersistentClient(path=os.getenv("CHROMA_DB_PATH", "mmos/vector_db"))
 
+    def _get_embedding(self, input: str | List[str] | Iterable[int] | Iterable[Iterable[int]],) -> List:
+        print(input)
+        response = self.client.embeddings.create(
+            model=self.embedding_model,
+            input=input,
+        )
+        return [embedding.embedding for embedding in response.data]
+    
+    def _calculate_vector_similarity(self, vector1: List[float], vector2: List[float], method: Literal["cosine", "euclidean", "dot_product", "manhattan", "jaccard"] = "cosine") -> float:
+        """计算两个向量之间的相似度。
+        
+        参数:
+            vector1: 第一个向量
+            vector2: 第二个向量
+            method: 计算方法
+                - cosine: 余弦相似度，1：完全同向（相似）0：正交（无关）-1：完全反向（不相似）
+                - euclidean: 欧几里得距离，值越小表示相似度越高（0最相似）
+                - dot_product: 点积，值越大表示相似度越高
+                - manhattan: 曼哈顿距离，值越小表示相似度越高（0最相似）
+                - jaccard: 杰卡德相似度，值越大表示相似度越高（1最相似，0最不相似）
+        
+        返回:
+            相似度得分
+        """
+        # 将输入向量转换为2D数组（sklearn要求的格式）
+        v1 = np.array(vector1).reshape(1, -1)
+        v2 = np.array(vector2).reshape(1, -1)
+        
+        if method == "cosine":
+            # 余弦相似度：测量两个向量夹角的余弦值
+            return cosine_similarity(v1, v2)
+        elif method == "euclidean":
+            # 欧几里得距离：测量两点之间的直线距离
+            return euclidean_distances(v1, v2)[0][0]
+        elif method == "dot_product":
+            # 点积：直接计算向量点积，适用于归一化向量
+            return np.dot(v1, v2.T)[0][0]
+        elif method == "manhattan":
+            # 曼哈顿距离：测量沿坐标轴的距离总和
+            return manhattan_distances(v1, v2)[0][0]
+        elif method == "jaccard":
+            # 杰卡德相似度：集合相似度度量
+            # 对于二元向量或稀疏特征，使用pairwise_distances计算Jaccard距离
+            # 首先将向量转换为二进制形式（>0的元素设为1）
+            binary_v1 = (v1 > 0).astype(int)
+            binary_v2 = (v2 > 0).astype(int)
+            
+            # 如果两个向量都是零向量，返回1.0（完全相似）
+            if not np.any(binary_v1) and not np.any(binary_v2):
+                return 1.0
+                
+            # 计算Jaccard距离（1减去相似度）
+            jaccard_dist = pairwise_distances(binary_v1, binary_v2, metric='jaccard')[0][0]
+            # 返回Jaccard相似度（1减去距离）
+            return 1.0 - jaccard_dist
+        
+    def split_message(self, messages: List[Dict[str, str]],instant_count: int = 1, similarity_threshold: float = 0.5) -> List[Dict[str, str]]:
+        """
+        将消息列表按即时消息数量分割成多个子列表
+        
+        参数:
+            messages: 消息列表
+            instant_count: 每个子列表中即时消息的数量
+            similarity_threshold: 相似度阈值
+        返回:
+            分割后的消息列表
+        """
+        user_messages = []
+        for item in messages:
+            if item.get("role") == "user" and item.get("content") is not None:
+                user_messages.append(item["content"])
+            
+        for i in range(0, len(messages), instant_count):
+            result.append(messages[i:i+instant_count])
+        return result
 
+if __name__ == "__main__":
+    short_memory = ShortMemory()
+    # 指代消解（Coreference Resolution）实现
+    for i in test_cases:
+        embedding = short_memory._get_embedding([i["messages"][0]["content"],i["messages"][0]["content"]+" "+i["messages"][2]["content"]])
+        result = short_memory._calculate_vector_similarity(embedding[0], embedding[1])
+        print(result)
